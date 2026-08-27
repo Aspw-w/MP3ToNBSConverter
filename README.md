@@ -26,6 +26,9 @@ trusting a single threshold or model:
 4. [Basic Pitch](https://github.com/spotify/basic-pitch) transcribes vocals,
    bass, accompaniment, and a second pass specialized for short attacks. Every
    active melodic stem also receives a locally normalized weak-phrase pass.
+   All passes retain Basic Pitch's complete A0-C8 output instead of applying
+   role-specific hard cutoffs, and the transient pass accepts attacks down to
+   30 ms before source validation.
    Smooth gain compression is used only as model input; it cannot alter output
    velocity. Any audible piano or guitar cue selected for a protected lane is
    transcribed independently in both ordinary and weak-phrase passes.
@@ -43,17 +46,20 @@ trusting a single threshold or model:
    after validation against their untouched isolated stem. Recurrence supports
    ambiguous notes, while a one-off quiet note can survive when its pitch-band
    S/N and physical attack are independently clear. Core-note duplicates,
-   separator leakage, and excess events above a strict song-length budget are
-   rejected. The first three accompaniment lanes remain lead, low anchor, and
-   harmony; additional lanes are reserved for independently supported
-   instruments.
+   and separator leakage are rejected. Independently verified guitar or piano
+   unisons are retained rather than mistaken for leakage. The voice planner
+   allocates background lanes from measured simultaneous demand (including
+   multiple lanes for an isolated piano/guitar chord), leaving all remaining
+   lanes available to supported core tones.
 9. Each neural onset is refined exactly once from a short-window, pitch-harmonic
    attack track in its own aligned stem. Drum attacks from the full mix and a
    second beat-lattice snap cannot move melodic notes. Overlapping chord tones
-   may share an onset only when the complete group fits within the tolerance;
-   transitive chaining cannot collapse a short sequence. A role-aware voice
-   planner then protects the lead and low chord anchor, limits chord size, and
-   assigns one stable instrument to each NBS layer for the entire song.
+   may share an onset only when the complete group fits inside a 20 ms window
+   and no tone moves by more than 12.5 ms; audible strums stay staggered.
+   Overlapping repeated attacks at the same pitch are kept as separate notes.
+   A role-aware voice planner then protects the lead and low chord anchor,
+   retains up to 12 independently supported tones by default, and assigns one
+   stable instrument to each NBS layer for the entire song.
 10. Per-note velocity is measured from that note's own CQT pitch band at its
     unquantized source time. Neural confidence only trims the result and is never
     treated as volume. Quiet source notes retain quiet velocities without a
@@ -62,11 +68,15 @@ trusting a single threshold or model:
     removes a false candidate before writing. Protected guitar and piano lanes
     use their own isolated waveforms rather than the louder combined
     accompaniment.
-11. Independent CQT analysis checks active regions that still have no credible
-   AI note and restores only locally supported missing notes.
+11. Independent CQT analysis checks every physical attack for pitch-specific
+   holes, including a missing inner tone at an onset where the AI already found
+   part of the chord. Recovery is no longer limited to a small percentage of
+   the primary transcription.
 12. Kick, snare, and hi-hat transients are analyzed in separate frequency bands.
-   Composite hits may retain two strongly supported components instead of being
-   collapsed into one drum or expanded into a noisy three-note stack.
+   Composite hits retain every independently supported component—including a
+   real three-part kick/snare/hat hit—without expanding weak bands into a noisy
+   stack. Neighboring band detections are grouped into one bounded physical
+   attack and its time is refined between analysis frames.
 13. Tempo is tracked from a high-resolution consensus of the percussion and
     complete mix, resolves only well-supported half/double-tempo extremes, and
     is fitted across the complete beat sequence instead of trusting one
@@ -78,7 +88,10 @@ trusting a single threshold or model:
     accumulate timing drift.
 14. The default native NBS timeline is `40.00 ticks/s`, limiting serialization
     error to 12.5 ms and keeping rapid notes distinct. A pre-write invariant
-    checks every timed neural and percussion note against its source position.
+    checks every timed neural, spectral, and percussion note against its source
+    position. For recordings too long for 40 ticks/s in NBS v5's 16-bit
+    timeline, precise mode automatically chooses the finest representable rate
+    rather than failing or accumulating drift.
     `--timing minecraft` deliberately uses the coarser NBT-compatible
     `10.00 ticks/s` grid when in-game schematic/structure timing is required.
 
@@ -121,8 +134,8 @@ Use `--force` to overwrite an existing output file.
 # Override detected BPM while retaining the precise 40 ticks/s timeline.
 .\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --bpm 128
 
-# Deliberately use the coarser Minecraft schematic/structure-compatible timeline.
-.\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --timing minecraft
+# Deliberately use Minecraft-compatible timing and fold pitches into its range.
+.\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --timing minecraft --minecraft-range
 
 # Use an eight-subdivision BPM grid for NBS-only playback.
 .\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --timing beat --bpm 128 --ticks-per-beat 8
@@ -131,8 +144,7 @@ Use `--force` to overwrite an existing output file.
 .\.venv\Scripts\python.exe mp3_to_nbs.py instrumental.mp3 --vocals off
 .\.venv\Scripts\python.exe mp3_to_nbs.py vocal.mp3 --vocals on
 
-# Reduce or increase the maximum accompaniment voice count. The default four
-# lanes are lead, low anchor, harmony, and one protected background instrument.
+# Reduce or increase the maximum accompaniment voice count (default: 12).
 .\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --max-chord-notes 2
 
 # Increase sensitivity only if the automatic weak-phrase recovery still misses notes.
@@ -147,8 +159,8 @@ Use `--force` to overwrite an existing output file.
 # Skip Demucs for a faster, lower-quality conversion.
 .\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --separation basic
 
-# Keep the full 88-key NBS range instead of folding pitches into Minecraft's range.
-.\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --full-range
+# Lossily fold the default full 88-key output for an in-game note-block build.
+.\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --minecraft-range
 ```
 
 Show every option with:
@@ -190,25 +202,28 @@ mechanical one-note repetition heard at a one-beat interval. Continuations also
 cannot be normalized back into false full-strength accents. Use
 `--retrigger-beats 0` when a sound pack has long samples and needs no sustain
 refresh. Each continuation is calculated from its original source onset rather
-than from the preceding rounded tick. Minecraft's playable note-block range is
-only two octaves, so the default mode folds source octaves and keeps one note per
-pitch class to avoid noisy unison stacks.
+than from the preceding rounded tick. Native NBS output keeps the complete
+88-key range and distinct octave doublings by default. `--minecraft-range`
+folds out-of-range pitches by octaves and deduplicates only notes that collapse
+to the exact same instrument and output key.
 
 Use the default sensitivity first. The converter already runs a locally
 normalized weak-phrase pass and validates its candidates against the untouched
 source, so a global sensitivity increase is normally unnecessary. Raise it in
 small steps only when an important part remains absent; excessive sensitivity
-necessarily increases ambiguous candidates. If a short shout is intentionally part of the melody, use
-`--vocals on`. If an instrument is mistaken for a singer, use `--vocals off`.
-The default fourth accompaniment lane protects the most prominent independently
-separated guitar or piano part. Increase `--max-chord-notes` to 5 only when a
-song clearly contains both and the extra density is appropriate.
+necessarily increases ambiguous candidates. If a short shout is intentionally
+part of the melody, use `--vocals on`. If an instrument is mistaken for a
+singer, use `--vocals off`. The default 12 accompaniment lanes cover dense
+two-handed chords while reserving lanes only for piano or guitar stems that are
+actually supported. Lower `--max-chord-notes` when a deliberately sparse
+Minecraft arrangement is preferred.
 
 The default `--timing precise` and optional `--timing beat` can produce a tick
 rate other than 10, 5, or 2.5 ticks/s. Such a song plays at the intended speed
 in Open Note Block Studio but can change speed after Minecraft NBT or structure
-export. Select `--timing minecraft` for that in-game export path; its 100 ms grid
-necessarily merges source attacks that occur inside the same tick.
+export. Select `--timing minecraft --minecraft-range` for that in-game export
+path; its 100 ms grid necessarily merges source attacks that occur inside the
+same tick, and its two-octave range cannot retain every source register.
 
 ## Tests
 

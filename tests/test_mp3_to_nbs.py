@@ -153,54 +153,54 @@ class SeparationTests(unittest.TestCase):
         self.assertEqual(result.melodic_notes, 12)
         self.assertEqual(result.total_notes, 18)
 
-    def test_adjacent_ai_fragments_can_be_joined_for_a_solo_line(self):
+    def test_adjacent_same_pitch_attacks_are_not_joined(self):
         events = [
-            _TimedPitchEvent(0.00, 0.40, 60, 0.7),
-            _TimedPitchEvent(0.50, 0.90, 60, 0.8),
+            _TimedPitchEvent(0.00, 0.60, 60, 0.7, onset_strength=0.8),
+            _TimedPitchEvent(0.50, 0.90, 60, 0.8, onset_strength=0.9),
         ]
-        separate = _quantize_timed_pitch_events(events, 0.0, 0.25, 8)
-        joined = _quantize_timed_pitch_events(
+        quantized = _quantize_timed_pitch_events(
             events, 0.0, 0.25, 8, join_gap_ticks=1
         )
-        self.assertEqual(len(separate), 2)
         self.assertEqual(
-            [(event.start_tick, event.end_tick, event.midi) for event in joined],
-            [(0, 4, 60)],
+            [(event.start_tick, event.end_tick, event.midi) for event in quantized],
+            [(0, 3, 60), (2, 4, 60)],
         )
 
-    def test_overlapping_chord_jitter_is_not_treated_as_an_arpeggio(self):
+    def test_only_sub_tick_chord_jitter_is_coalesced(self):
         chord = _coalesce_polyphonic_onsets(
             [
                 _TimedPitchEvent(1.046, 1.50, 60, 0.90),
-                _TimedPitchEvent(1.095, 1.55, 64, 0.75),
+                _TimedPitchEvent(1.054, 1.55, 64, 0.75),
             ]
         )
-        short_sequence = _coalesce_polyphonic_onsets(
+        audible_strum = _coalesce_polyphonic_onsets(
             [
-                _TimedPitchEvent(2.00, 2.06, 60, 0.90),
-                _TimedPitchEvent(2.05, 2.12, 62, 0.80),
+                _TimedPitchEvent(2.00, 2.20, 60, 0.90),
+                _TimedPitchEvent(2.05, 2.25, 64, 0.80),
             ]
         )
 
         self.assertEqual(chord[0].start_seconds, chord[1].start_seconds)
         self.assertNotEqual(
-            short_sequence[0].start_seconds,
-            short_sequence[1].start_seconds,
+            audible_strum[0].start_seconds,
+            audible_strum[1].start_seconds,
         )
 
     def test_chord_coalescing_cannot_chain_beyond_its_tolerance(self):
         events = [
             _TimedPitchEvent(0.00, 0.30, 60, 0.60),
-            _TimedPitchEvent(0.05, 0.30, 64, 0.70),
-            _TimedPitchEvent(0.10, 0.30, 67, 0.90),
+            _TimedPitchEvent(0.01, 0.30, 64, 0.70),
+            _TimedPitchEvent(0.02, 0.30, 67, 0.90),
         ]
 
-        coalesced = _coalesce_polyphonic_onsets(events, tolerance_seconds=0.055)
+        coalesced = _coalesce_polyphonic_onsets(
+            events, tolerance_seconds=0.015
+        )
         by_midi = {event.midi: event.start_seconds for event in coalesced}
 
         self.assertEqual(by_midi[60], by_midi[64])
-        self.assertEqual(by_midi[67], 0.10)
-        self.assertLessEqual(abs(by_midi[60] - events[0].start_seconds), 0.055)
+        self.assertEqual(by_midi[67], 0.02)
+        self.assertLessEqual(abs(by_midi[60] - events[0].start_seconds), 0.0125)
 
     def test_pitch_specific_onset_refinement_finds_one_physical_attack(self):
         import librosa
@@ -237,6 +237,39 @@ class SeparationTests(unittest.TestCase):
             0.003,
         )
 
+    def test_onset_refinement_does_not_collapse_rapid_repeated_pitch(self):
+        import librosa
+
+        sample_rate = 22_050
+        times = np.arange(sample_rate * 2, dtype=np.float32) / sample_rate
+        audio = np.zeros_like(times)
+        for start in (1.0, 1.075):
+            active = (times >= start) & (times < start + 0.055)
+            local_time = times[active] - start
+            audio[active] += (
+                np.exp(-18.0 * local_time)
+                * np.sin(2.0 * np.pi * 261.6256 * times[active])
+            )
+
+        refined = _analyze_timed_pitch_events(
+            [
+                _TimedPitchEvent(0.985, 1.055, 60, 0.8),
+                _TimedPitchEvent(1.060, 1.140, 60, 0.8),
+            ],
+            audio,
+            sample_rate,
+            ConversionConfig(bpm=120),
+            librosa,
+            np,
+            role="piano",
+            reject_unsupported=False,
+        )
+
+        self.assertEqual(len(refined), 2)
+        self.assertGreater(
+            refined[1].start_seconds - refined[0].start_seconds, 0.04
+        )
+
     def test_only_near_identical_ai_stem_leakage_is_removed(self):
         foreground = [_TimedPitchEvent(1.0, 2.0, 60, 0.8)]
         background = [
@@ -249,6 +282,19 @@ class SeparationTests(unittest.TestCase):
         self.assertEqual(
             _remove_overlapping_timed_duplicates(background, foreground),
             background[:3] + background[4:],
+        )
+
+    def test_independently_supported_instrument_unison_is_not_leakage(self):
+        foreground = [_TimedPitchEvent(1.0, 2.0, 60, 0.8)]
+        guitar_unison = _TimedPitchEvent(
+            1.01, 1.95, 60, 0.7, source_role="guitar"
+        )
+
+        self.assertEqual(
+            _remove_overlapping_timed_duplicates(
+                [guitar_unison], foreground
+            ),
+            [guitar_unison],
         )
 
     def test_transient_pass_keeps_short_funk_attack_without_doubling_primary(self):
@@ -299,6 +345,29 @@ class SeparationTests(unittest.TestCase):
         self.assertLessEqual(captured["minimum_note_length"], 55.0)
         self.assertLessEqual(captured["minimum_frequency"], 83.0)
         self.assertFalse(captured["melodia_trick"])
+
+    def test_neural_pass_keeps_the_complete_nbs_pitch_range(self):
+        captured = {}
+
+        def fake_predict(_path, _model, **settings):
+            captured.update(settings)
+            return None, None, [
+                (0.0, 0.04, 21, 0.8, None),
+                (0.1, 0.14, 108, 0.8, None),
+            ]
+
+        events = _predict_timed_pitch_events(
+            Path("unused.wav"),
+            object(),
+            fake_predict,
+            role="other_transient",
+            sensitivity=0.5,
+        )
+
+        self.assertEqual([event.midi for event in events], [21, 108])
+        self.assertLessEqual(captured["minimum_frequency"], 27.5)
+        self.assertGreaterEqual(captured["maximum_frequency"], 4186.0)
+        self.assertLessEqual(captured["minimum_note_length"], 30.0)
 
     def test_adaptive_model_pass_uses_more_permissive_neural_gates(self):
         settings_by_pass = []
@@ -441,7 +510,45 @@ class SeparationTests(unittest.TestCase):
         )
         self.assertEqual(selected, [replace(recovery[1], layer=3)])
 
-    def test_local_recovery_budget_cannot_dominate_primary_transcription(self):
+    def test_local_recovery_can_fill_a_missing_tone_in_an_existing_chord(self):
+        class FakeLibrosa:
+            class onset:
+                @staticmethod
+                def onset_strength(**_kwargs):
+                    return np.array([0.0, 0.1, 1.0, 0.1, 0.0])
+
+                @staticmethod
+                def onset_detect(**_kwargs):
+                    return np.array([2])
+
+            class feature:
+                @staticmethod
+                def rms(**_kwargs):
+                    return np.ones((1, 10), dtype=np.float32)
+
+            @staticmethod
+            def frames_to_time(frames, **_kwargs):
+                return np.asarray(frames, dtype=np.float32) * 0.1
+
+        primary = [NbsNote(2, 2, 0, 39, source_midi=60)]
+        missing_tone = NbsNote(2, 2, 0, 43, source_midi=64)
+
+        selected = _select_local_accompaniment_recovery(
+            primary,
+            [missing_tone],
+            np.ones(1_000, dtype=np.float32),
+            1_000,
+            0.0,
+            0.1,
+            20,
+            ConversionConfig(bpm=120),
+            FakeLibrosa,
+            np,
+        )
+
+        self.assertEqual(selected, [replace(missing_tone, layer=3)])
+
+    def test_local_recovery_keeps_independent_physical_onsets(self):
         class DenseFakeLibrosa:
             class onset:
                 @staticmethod
@@ -475,11 +582,18 @@ class SeparationTests(unittest.TestCase):
             DenseFakeLibrosa,
             np,
         )
-        self.assertLessEqual(len(selected), 4)
+        self.assertGreater(len(selected), 4)
+        self.assertTrue(
+            all(
+                abs(first.tick - second.tick) > 1
+                for first, second in zip(selected, selected[1:])
+            )
+        )
 
-    def test_default_configuration_uses_sparse_ai_transcription(self):
+    def test_default_configuration_preserves_dense_full_range_music(self):
         config = ConversionConfig()
-        self.assertEqual(config.max_chord_notes, 4)
+        self.assertEqual(config.max_chord_notes, 12)
+        self.assertFalse(config.minecraft_range)
         self.assertEqual(config.transcription, "ai")
         self.assertEqual(config.retrigger_beats, 2.0)
         self.assertEqual(config.vocals, "auto")
@@ -495,8 +609,8 @@ class SeparationTests(unittest.TestCase):
                 "Bass",
                 "Accompaniment lead",
                 "Accompaniment low anchor",
-                "Accompaniment harmony",
-                "Instrument background 1",
+                "Accompaniment voice 3",
+                "Accompaniment voice 4",
             ],
         )
 
@@ -527,6 +641,38 @@ class SeparationTests(unittest.TestCase):
         self.assertEqual(by_tick[0][1], 47)
         self.assertEqual(by_tick[4][0], 62)
         self.assertEqual(by_tick[4][1], 49)
+
+    def test_polyphonic_planner_keeps_a_dense_supported_chord(self):
+        pitches = [36, 48, 55, 60, 64, 67, 72, 76, 79, 84]
+        events = [
+            _QuantizedPitchEvent(0, 12, midi, 0.40 + index * 0.02)
+            for index, midi in enumerate(pitches)
+        ]
+
+        arranged = _arrange_polyphonic_events(events, max_voices=12)
+
+        self.assertEqual({event.midi for event in arranged}, set(pitches))
+        self.assertEqual(len({event.voice for event in arranged}), len(pitches))
+
+    def test_full_range_output_keeps_distinct_octave_doublings(self):
+        notes = _ai_events_to_nbs(
+            [
+                _TimedPitchEvent(0.0, 0.5, midi, 0.8)
+                for midi in (48, 60, 72)
+            ],
+            0.0,
+            0.025,
+            40,
+            np.zeros(40, dtype=np.int16),
+            ConversionConfig(bpm=120, max_chord_notes=3),
+            layer_offset=0,
+            max_notes=3,
+            default_instrument=0,
+            velocity_scale=1.0,
+        )
+
+        self.assertEqual({note.source_midi for note in notes}, {48, 60, 72})
+        self.assertEqual(len({note.key for note in notes}), 3)
 
     def test_polyphonic_planner_does_not_drop_a_quiet_continuing_focus(self):
         events = [
@@ -568,6 +714,28 @@ class SeparationTests(unittest.TestCase):
         self.assertEqual(by_tick[4][3].midi, 59)
         self.assertEqual(
             _stable_voice_instruments(arranged, None, None)[3], 5
+        )
+
+    def test_polyphonic_planner_preserves_an_isolated_background_chord(self):
+        events = [
+            _QuantizedPitchEvent(0, 8, 60, 0.82),
+            _QuantizedPitchEvent(0, 8, 64, 0.76),
+            _QuantizedPitchEvent(0, 8, 67, 0.72),
+            _QuantizedPitchEvent(0, 8, 48, 0.68, source_role="piano"),
+            _QuantizedPitchEvent(0, 8, 52, 0.66, source_role="piano"),
+            _QuantizedPitchEvent(0, 8, 55, 0.64, source_role="piano"),
+        ]
+
+        arranged = _arrange_polyphonic_events(events, 9)
+        piano_events = [
+            event for event in arranged if event.source_role == "piano"
+        ]
+
+        self.assertEqual({event.midi for event in piano_events}, {48, 52, 55})
+        self.assertEqual(len({event.voice for event in piano_events}), 3)
+        instruments = _stable_voice_instruments(arranged, None, None)
+        self.assertTrue(
+            all(instruments[event.voice] == 0 for event in piano_events)
         )
 
     def test_background_merge_requires_recurrence_and_avoids_doubles(self):
@@ -884,6 +1052,10 @@ class SeparationTests(unittest.TestCase):
 
     def test_drum_component_selection_keeps_simultaneous_supported_hits(self):
         self.assertEqual(_select_drum_components([0.9, 0.2, 0.7], 0.5), [0, 2])
+        self.assertEqual(
+            _select_drum_components([0.90, 0.82, 0.78], 0.5),
+            [0, 1, 2],
+        )
         self.assertEqual(_select_drum_components([0.1, 0.12, 0.08], 0.5), [])
 
     def test_sustained_voice_is_kept_but_instrument_leakage_is_rejected(self):
@@ -982,6 +1154,20 @@ class TimingTests(unittest.TestCase):
         ticks_per_second, displayed_bpm = _resolve_timing_grid(136.0, config)
         self.assertEqual(ticks_per_second, MINECRAFT_TIMELINE_TPS)
         self.assertEqual(displayed_bpm, 136.0)
+
+    def test_precise_grid_adapts_resolution_instead_of_rejecting_long_audio(self):
+        duration_seconds = 60.0 * 60.0
+        ticks_per_second, displayed_bpm = _resolve_timing_grid(
+            120.0,
+            ConversionConfig(),
+            duration_seconds,
+        )
+
+        self.assertLess(ticks_per_second, PRECISE_TIMELINE_TPS)
+        self.assertLessEqual(
+            int(np.ceil(duration_seconds * ticks_per_second)), 65_535
+        )
+        self.assertEqual(displayed_bpm, 120.0)
 
     def test_whole_song_beats_remove_frame_quantization_tempo_error(self):
         frame_seconds = 512 / 22_050
@@ -1151,6 +1337,15 @@ class TimingTests(unittest.TestCase):
         self.assertTrue(all(note.continuation for note in notes[1:]))
         self.assertTrue(
             all(note.velocity < notes[0].velocity for note in notes[1:])
+        )
+        expected_source_times = [
+            0.049 + repeat_index * 60.0 / 136.0
+            for repeat_index in range(5)
+        ]
+        np.testing.assert_allclose(
+            [note.source_time_seconds for note in notes],
+            expected_source_times,
+            atol=1e-9,
         )
 
     def test_retrigger_zero_preserves_source_attacks_only(self):

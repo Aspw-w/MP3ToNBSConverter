@@ -65,6 +65,7 @@ MINECRAFT_TIMELINE_TPS = 10.0
 # in the unsigned 16-bit song-length field for ordinary songs.  The explicitly
 # selected ``minecraft`` mode remains fixed at the redstone-compatible 10 TPS.
 PRECISE_TIMELINE_TPS = 40.0
+MINIMUM_NBS_TIMELINE_TPS = 0.25
 ADAPTIVE_TRANSCRIPTION_CACHE_VERSION = 1
 YAMNET_SAMPLE_RATE = 16_000
 YAMNET_MODEL_URL = (
@@ -135,12 +136,19 @@ class NbsNote:
 class ConversionConfig:
     bpm: float | None = None
     ticks_per_beat: int = 4
-    max_chord_notes: int = 4
+    # Twelve lanes cover full two-handed piano voicings and dense ensemble
+    # attacks without imposing the old four-note loss before source validation.
+    # Empty lanes are cheap in NBS, while a discarded chord tone is
+    # unrecoverable after arrangement.
+    max_chord_notes: int = 12
     sensitivity: float = 0.5
     retrigger_beats: float = 2.0
     instrument: int | None = None
     include_drums: bool = True
-    minecraft_range: bool = True
+    # Native NBS supports all 88 piano keys.  Folding is an explicitly lossy
+    # compatibility mode for Minecraft builds and must not be the fidelity
+    # default.
+    minecraft_range: bool = False
     sample_rate: int = 22_050
     hop_length: int = 256
     time_signature: int = 4
@@ -162,8 +170,9 @@ class ConversionResult:
     accompaniment_notes: int
     drum_notes: int
     layer_count: int
-    timing: str = "minecraft"
+    timing: str = "precise"
     vocal_handling: str = "dedicated"
+    maximum_timing_error_seconds: float = 0.0
 
     @property
     def melodic_notes(self) -> int:
@@ -193,6 +202,7 @@ class _PitchEvent:
     panning: int
     strength_db: float
     continuation: bool = False
+    source_time_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -496,7 +506,9 @@ def _validate_source_timing(
 
 
 def _resolve_timing_grid(
-    bpm: float, config: ConversionConfig
+    bpm: float,
+    config: ConversionConfig,
+    duration_seconds: float | None = None,
 ) -> tuple[float, float]:
     """Return the serialized NBS tick rate and the displayed song BPM.
 
@@ -508,7 +520,25 @@ def _resolve_timing_grid(
     """
 
     if config.timing == "precise":
-        return PRECISE_TIMELINE_TPS, bpm
+        ticks_per_second = PRECISE_TIMELINE_TPS
+        if duration_seconds is not None and duration_seconds > 0.0:
+            # NBS v5 stores tick positions in an unsigned 16-bit field.  Use
+            # the finest exactly serializable clock instead of rejecting long
+            # recordings outright.  Quantization remains absolute, so the
+            # lower resolution increases bounded local error but never drift.
+            length_limited_tps = (
+                math.floor(MAX_NBS_TICK / duration_seconds * 100.0) / 100.0
+            )
+            ticks_per_second = min(ticks_per_second, length_limited_tps)
+            if ticks_per_second < MINIMUM_NBS_TIMELINE_TPS:
+                maximum_hours = (
+                    MAX_NBS_TICK / MINIMUM_NBS_TIMELINE_TPS / 3600.0
+                )
+                raise ConversionError(
+                    "The recording is longer than the NBS v5 timeline can "
+                    f"represent (about {maximum_hours:.1f} hours)."
+                )
+        return ticks_per_second, bpm
     if config.timing == "minecraft":
         return MINECRAFT_TIMELINE_TPS, bpm
     if config.timing == "beat":
@@ -559,6 +589,26 @@ def _iter_phase_locked_retrigger_ticks(
 ) -> Iterable[int]:
     """Yield repeats anchored to the exact onset without cumulative drift."""
 
+    for tick, _position in _iter_phase_locked_retrigger_positions(
+        start_tick,
+        end_tick,
+        config,
+        phase_tick=phase_tick,
+        end_phase_tick=end_phase_tick,
+    ):
+        yield tick
+
+
+def _iter_phase_locked_retrigger_positions(
+    start_tick: int,
+    end_tick: int,
+    config: ConversionConfig,
+    *,
+    phase_tick: float | None = None,
+    end_phase_tick: float | None = None,
+) -> Iterable[tuple[int, float]]:
+    """Yield each serialized repeat and its unrounded canonical position."""
+
     interval = _retrigger_interval_ticks_exact(config)
     if interval <= 0.0 or end_tick <= start_tick + 1:
         return
@@ -575,7 +625,7 @@ def _iter_phase_locked_retrigger_ticks(
         if tick >= end_tick:
             return
         if tick > previous_tick:
-            yield tick
+            yield tick, position
             previous_tick = tick
         repeat_index += 1
 
@@ -1159,20 +1209,26 @@ def _select_background_stem_roles(
 
 
 def _demucs_layer_layout(
-    use_vocals: bool, max_chord_notes: int
+    use_vocals: bool,
+    max_chord_notes: int,
+    background_roles: Sequence[str] = (),
 ) -> tuple[int, int, int, list[str]]:
     bass_layer = 1 if use_vocals else 0
     accompaniment_layer_offset = bass_layer + 1
     drum_layer_offset = accompaniment_layer_offset + max_chord_notes
-    accompaniment_names = ["Accompaniment lead"]
+    # Background instruments can receive more than one lane when their
+    # measured chord polyphony requires it, so role-specific names assigned
+    # before transcription would be misleading.  Keep functional lane names;
+    # the serialized instrument field carries the eventual timbre.
+    _ = background_roles
+    accompaniment_names = ["Accompaniment lead"] if max_chord_notes else []
     if max_chord_notes >= 2:
         accompaniment_names.append("Accompaniment low anchor")
     if max_chord_notes >= 3:
-        accompaniment_names.append("Accompaniment harmony")
-    accompaniment_names.extend(
-        f"Instrument background {number}"
-        for number in range(1, max(0, max_chord_notes - 3) + 1)
-    )
+        accompaniment_names.extend(
+            f"Accompaniment voice {number}"
+            for number in range(3, max_chord_notes + 1)
+        )
     layer_names = (
         (["Vocal melody"] if use_vocals else [])
         + ["Bass"]
@@ -1888,6 +1944,29 @@ def _analyze_timed_pitch_events(
         "guitar": 0.060,
         "piano": 0.060,
     }
+    role_tolerance = onset_tolerances.get(role, 0.060)
+    starts_by_midi: dict[int, list[float]] = defaultdict(list)
+    for event in event_list:
+        starts_by_midi[event.midi].append(event.start_seconds)
+    local_tolerances: list[float] = []
+    for event in event_list:
+        neighboring_distances = [
+            abs(other_start - event.start_seconds)
+            for other_start in starts_by_midi[event.midi]
+            if abs(other_start - event.start_seconds) > 1e-9
+        ]
+        if neighboring_distances:
+            # Two rapid strikes of one pitch must not both refine to the
+            # stronger attack in their overlapping search windows.  Keep each
+            # search inside slightly less than half the nearest model-onset
+            # distance; a lone note retains the wider decoder-correction range.
+            role_local_tolerance = min(
+                role_tolerance,
+                max(0.006, 0.45 * min(neighboring_distances)),
+            )
+        else:
+            role_local_tolerance = role_tolerance
+        local_tolerances.append(role_local_tolerance)
     tracks_by_midi = {
         midi: _pitch_analysis_tracks(analysis, midi, np)
         for midi in {event.midi for event in event_list}
@@ -1917,11 +1996,11 @@ def _analyze_timed_pitch_events(
             analysis,
             config.sensitivity,
             np,
-            onset_tolerance_seconds=onset_tolerances.get(role, 0.060),
+            onset_tolerance_seconds=local_tolerance,
             tracks=tracks_by_midi.get(event.midi),
             onset_data=onset_by_midi.get(event.midi),
         )
-        for event in event_list
+        for event, local_tolerance in zip(event_list, local_tolerances)
     ]
     if reject_unsupported:
         measured = [
@@ -1946,24 +2025,21 @@ def _predict_timed_pitch_events(
 ) -> list[_TimedPitchEvent]:
     """Transcribe a separated stem into confidence-weighted note events."""
 
+    full_low = NBS_LOWEST_MIDI
+    full_high = NBS_LOWEST_MIDI + NBS_KEY_MAX
     settings = {
-        # onset, frame, minimum length (ms), minimum MIDI, maximum MIDI
-        # Lead lines are monophonicized later, so their neural pass can be more
-        # permissive without turning into a chord cloud.  The old 130/150 ms
-        # gates omitted short syllables and funk bass ghost notes.
-        "vocals": (0.52, 0.34, 70.0, 40, 88),    # E2 .. E6
-        "bass": (0.54, 0.37, 95.0, 28, 60),      # E1 .. C4
-        # Keep the first accompaniment pass deliberately selective.  A second
-        # pass below is tuned for the 50-150 ms guitar/clav/brass attacks that
-        # are common in funk and were previously discarded by the 180 ms gate.
-        # E2 is required for the lower strings of a rhythm guitar.
-        "other": (0.64, 0.44, 150.0, 40, 96),    # E2 .. C7
-        "other_transient": (0.53, 0.35, 55.0, 40, 96),
-        # These passes run on independently separated instrument stems. They
-        # can be more permissive than the mixed accompaniment pass without
-        # allowing unrelated instruments to compete for the same focus.
-        "guitar": (0.56, 0.38, 85.0, 40, 88),    # E2 .. E6
-        "piano": (0.58, 0.40, 100.0, 40, 96),    # E2 .. C7
+        # onset, frame, minimum length (ms), minimum MIDI, maximum MIDI.
+        # Stem names are useful priors for arrangement, not safe hard pitch
+        # limits: piano left hands leak into ``other``, piccolo and soprano can
+        # exceed C7, and extended basses reach below E1.  Basic Pitch and NBS
+        # both natively span A0..C8, so every pass retains that complete range
+        # and lets source-resolved evidence reject unsupported harmonics.
+        "vocals": (0.52, 0.34, 35.0, full_low, full_high),
+        "bass": (0.54, 0.37, 40.0, full_low, full_high),
+        "other": (0.64, 0.44, 80.0, full_low, full_high),
+        "other_transient": (0.53, 0.35, 30.0, full_low, full_high),
+        "guitar": (0.56, 0.38, 40.0, full_low, full_high),
+        "piano": (0.58, 0.40, 35.0, full_low, full_high),
     }
     if role not in settings:
         raise ValueError(f"Unknown transcription role: {role}")
@@ -2025,6 +2101,10 @@ def _predict_timed_pitch_events(
         # Progress is already reported by the caller.
         with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            # Consume Basic Pitch's seconds-stamped note events directly.  Do
+            # not reconstruct times from its concatenated raw frame matrices:
+            # window/frame strides are not guaranteed to form one exact clock
+            # over a long recording.
             _, _, raw_events = predict(
                 stem_path,
                 prediction_model,
@@ -2081,14 +2161,16 @@ def _predict_timed_pitch_events(
 def _coalesce_polyphonic_onsets(
     events: Iterable[_TimedPitchEvent],
     *,
-    tolerance_seconds: float = 0.055,
+    tolerance_seconds: float = 0.020,
+    maximum_shift_seconds: float = 0.0125,
 ) -> list[_TimedPitchEvent]:
-    """Collapse bounded chord jitter without transitive time smearing.
+    """Coalesce only sub-grid model jitter, preserving audible strums.
 
-    The former union-find grouping was transitive: events at 0, 50 and 100 ms
-    could all join through the middle event even with a 55 ms tolerance.  Every
-    group here must fit inside one tolerance window and every added event must
-    overlap every existing member like a simultaneous chord tone.
+    Pitch-resolved attack refinement has already put every event on the source
+    timeline.  Moving chord tones by the former 55 ms tolerance could therefore
+    turn a real strum into a block chord or audibly delay its first tone.  This
+    pass now removes only smaller-than-one-precise-tick decoder jitter, and no
+    event is permitted to move by more than half a 40 TPS tick.
     """
 
     event_list = sorted(events, key=lambda event: (event.start_seconds, event.midi))
@@ -2124,17 +2206,14 @@ def _coalesce_polyphonic_onsets(
         if len(group) < 2:
             result.extend(group)
             continue
-        anchor_event = max(
-            group,
-            key=lambda event: (
-                event.onset_strength or 0.0,
-                event.pitch_loudness or 0.0,
-                event.amplitude,
-                event.end_seconds - event.start_seconds,
-                -event.start_seconds,
-            ),
-        )
-        anchor = anchor_event.start_seconds
+        ordered_starts = sorted(event.start_seconds for event in group)
+        anchor = ordered_starts[(len(ordered_starts) - 1) // 2]
+        if any(
+            abs(event.start_seconds - anchor) > maximum_shift_seconds
+            for event in group
+        ):
+            result.extend(group)
+            continue
         for event in group:
             shift = anchor - event.start_seconds
             result.append(
@@ -2188,16 +2267,9 @@ def _merge_accompaniment_passes(
     for event in retained:
         by_midi[event.midi].append(event)
 
-    # If the selective pass found almost nothing, the recovery pass is also
-    # allowed to restore sustained notes.  Otherwise it contributes only short
-    # attacks, keeping dense mixes from becoming a cloud of low-confidence notes.
-    sparse_limit = max(6, math.ceil(max(0.0, duration_seconds) * 0.15))
-    allow_sustained_recovery = len(retained) < sparse_limit
     for event in transient_recovery:
         event_duration = event.end_seconds - event.start_seconds
         if event_duration <= 0.0 or event.amplitude < 0.30:
-            continue
-        if event_duration > 0.65 and not allow_sustained_recovery:
             continue
         if any(
             _timed_events_are_duplicate(event, existing)
@@ -2281,8 +2353,6 @@ def _fuse_accompaniment_events(
         retained_by_midi[event.midi].append(calibrated)
 
     duration_seconds = len(audio) / max(1, sample_rate)
-    sparse_limit = max(6, math.ceil(duration_seconds * 0.15))
-    allow_sustained_recovery = len(measured_primary) < sparse_limit
     recovery_floor = 0.40 - 0.05 * config.sensitivity
     for event in measured_recovery:
         duration = event.end_seconds - event.start_seconds
@@ -2292,8 +2362,6 @@ def _fuse_accompaniment_events(
             else event.amplitude
         )
         if duration <= 0.0 or model_confidence < 0.30:
-            continue
-        if duration > 0.65 and not allow_sustained_recovery:
             continue
         if any(
             _timed_events_are_duplicate(event, existing)
@@ -2443,9 +2511,13 @@ def _merge_adaptive_recovery_events(
         )
         ranked.append((priority, event))
 
+    # Evidence gates above already operate per pitch and per physical attack.
+    # A low whole-song notes-per-second quota erased legitimate trills and fast
+    # quiet passages, so retain a safety ceiling that is well above playable
+    # musical rates and serves only as a pathological-model guard.
     maximum_additions = max(
-        12,
-        math.ceil(max(0.0, duration_seconds) * (2.0 if role == "other" else 1.25)),
+        64,
+        math.ceil(max(0.0, duration_seconds) * 64.0),
     )
     if len(ranked) > maximum_additions:
         ranked = sorted(ranked, key=lambda item: item[0], reverse=True)[
@@ -2475,7 +2547,9 @@ def _merge_instrument_background_events(
         retained_by_midi[event.midi].append(event)
 
     section_seconds = _clamp(duration_seconds / 18.0, 4.0, 10.0)
-    maximum_events_per_role = max(8, math.ceil(max(0.0, duration_seconds) * 1.25))
+    maximum_events_per_role = max(
+        64, math.ceil(max(0.0, duration_seconds) * 64.0)
+    )
     for role, role_material in background_by_role.items():
         if role not in BACKGROUND_ROLE_INSTRUMENTS:
             continue
@@ -2551,6 +2625,29 @@ def _merge_instrument_background_events(
     return sorted(retained, key=lambda event: (event.start_seconds, event.midi))
 
 
+def _quantized_events_share_attack(
+    previous: _QuantizedPitchEvent,
+    current: _QuantizedPitchEvent,
+    tick_seconds: float,
+) -> bool:
+    """Return whether two same-pitch candidates describe one source attack.
+
+    Duration overlap alone is not sufficient: transcription models commonly
+    let a held release overlap the next repeated strike.  Combining those
+    events erased repeated piano, guitar, and percussion-like pitched notes.
+    Only candidates whose canonical onsets are indistinguishable on the target
+    grid are deduplicated.
+    """
+
+    previous_time = previous.source_time_seconds
+    current_time = current.source_time_seconds
+    if previous_time is None or current_time is None:
+        return previous.start_tick == current.start_tick
+    onset_distance = abs(current_time - previous_time)
+    same_attack_tolerance = min(0.020, max(0.006, tick_seconds * 0.50))
+    return onset_distance <= same_attack_tolerance
+
+
 def _quantize_timed_pitch_events(
     events: Iterable[_TimedPitchEvent],
     timeline_origin_seconds: float,
@@ -2607,7 +2704,13 @@ def _quantize_timed_pitch_events(
                 if merged and merged[-1].midi == midi
                 else None
             ):
-                if event.start_tick <= merged_for_pitch.end_tick + join_gap_ticks:
+                if (
+                    event.start_tick
+                    <= merged_for_pitch.end_tick + join_gap_ticks
+                    and _quantized_events_share_attack(
+                        merged_for_pitch, event, tick_seconds
+                    )
+                ):
                     merged[-1] = _QuantizedPitchEvent(
                         start_tick=merged_for_pitch.start_tick,
                         end_tick=max(merged_for_pitch.end_tick, event.end_tick),
@@ -2700,6 +2803,12 @@ def _remove_overlapping_timed_duplicates(
 
     retained: list[_TimedPitchEvent] = []
     for event in background:
+        if event.source_role in BACKGROUND_ROLE_INSTRUMENTS:
+            # This note was independently measured in an isolated instrument
+            # stem.  A guitar or piano intentionally doubling the melody is
+            # musical unison, not separator leakage.
+            retained.append(event)
+            continue
         conflicts = foreground_by_midi.get(event.midi, ())
         leaked_duplicate = any(
             _timed_events_are_duplicate(event, other)
@@ -2954,20 +3063,19 @@ def _arrange_polyphonic_events(
     prepared_groups: list[tuple[int, list[_QuantizedPitchEvent]]] = []
     for start_tick in sorted(by_start):
         candidates = list(by_start[start_tick].values())
-        peak = max(event.amplitude for event in candidates)
-        # A locally quiet lead must remain available to the song-level path
-        # solver even when a simultaneous chord tone is much louder.  These
-        # events have already passed pitch-resolved source validation; later
-        # voice selection still applies stricter relative floors to support
-        # notes, so retaining the weak focus candidate does not inflate chords.
-        confidence_floor = max(0.28, peak * 0.34)
+        # Every incoming candidate has already passed pitch-resolved source
+        # validation.  A floor relative to the loudest chord tone used to erase
+        # legitimate quiet inner voices whenever the melody was strongly
+        # accented, so arrangement now applies only a conservative absolute
+        # floor.
+        confidence_floor = 0.27
         candidates = [
             event
             for event in candidates
             if (
                 event.amplitude >= confidence_floor
                 if event.source_role is None
-                else event.amplitude >= max(0.32, peak * 0.38)
+                else event.amplitude >= 0.30
             )
         ]
         if candidates:
@@ -2988,51 +3096,88 @@ def _arrange_polyphonic_events(
     )
 
     role_weights: dict[str, float] = defaultdict(float)
+    role_demands: dict[str, int] = defaultdict(int)
     for _start_tick, candidates in prepared_groups:
+        group_role_counts: dict[str, int] = defaultdict(int)
         for event in candidates:
             if event.source_role in BACKGROUND_ROLE_INSTRUMENTS:
                 role_weights[event.source_role] += (
                     event.amplitude * min(12, event.end_tick - event.start_tick + 1)
                 )
-    background_voice_count = max(0, max_voices - 3)
-    background_roles = [
+                group_role_counts[event.source_role] += 1
+        for role, count in group_role_counts.items():
+            role_demands[role] = max(role_demands[role], count)
+
+    ranked_background_roles = [
         role
         for role, _weight in sorted(
             role_weights.items(), key=lambda item: (-item[1], item[0])
-        )[:background_voice_count]
+        )
     ]
-    background_voice_by_role = {
-        role: 3 + index for index, role in enumerate(background_roles)
-    }
-    core_voice_limit = (
-        min(3, max_voices) if background_voice_by_role else max_voices
+    maximum_background_voices = min(
+        sum(role_demands.values()),
+        max(0, max_voices - 3),
+        max(len(ranked_background_roles), max_voices // 3),
     )
+    background_voice_counts = {
+        role: 0 for role in ranked_background_roles
+    }
+    # Give every audible role one lane first, then distribute remaining lanes
+    # according to measured simultaneous demand.  This preserves a quiet piano
+    # chord instead of reducing the entire isolated piano stem to one note.
+    for _slot in range(maximum_background_voices):
+        eligible = [
+            role
+            for role in ranked_background_roles
+            if background_voice_counts[role] < role_demands[role]
+        ]
+        if not eligible:
+            break
+        role = max(
+            eligible,
+            key=lambda candidate: (
+                background_voice_counts[candidate] == 0,
+                role_weights[candidate]
+                / (background_voice_counts[candidate] + 1),
+                role_demands[candidate] - background_voice_counts[candidate],
+            ),
+        )
+        background_voice_counts[role] += 1
+
+    background_voice_count = sum(background_voice_counts.values())
+    core_voice_limit = max(1, max_voices - background_voice_count)
+    background_voices_by_role: dict[str, list[int]] = {}
+    next_background_voice = core_voice_limit
+    for role in ranked_background_roles:
+        count = background_voice_counts[role]
+        background_voices_by_role[role] = list(
+            range(next_background_voice, next_background_voice + count)
+        )
+        next_background_voice += count
 
     result: list[_VoicedPitchEvent] = []
     previous_voice_pitch: dict[int, int] = {}
     consonant_intervals = {0, 3, 4, 5, 7, 8, 9}
 
     for start_tick, candidates in prepared_groups:
-        peak = max(event.amplitude for event in candidates)
         lead = focus_by_tick.get(start_tick)
         core_candidates = [
             event for event in candidates if event.source_role is None
         ]
         selected = [lead] if lead is not None else []
-        used_pitch_classes = {lead.midi % 12} if lead is not None else set()
         anchor: _QuantizedPitchEvent | None = None
 
         if core_voice_limit > 1:
             remaining = [
                 event
                 for event in core_candidates
-                if event is not lead and event.midi % 12 not in used_pitch_classes
+                if event is not lead
             ]
             if remaining:
                 supported_anchors = [
                     event
                     for event in remaining
-                    if event.amplitude >= max(0.34, peak * 0.60)
+                    if event.amplitude >= 0.30
                 ]
                 if supported_anchors:
                     anchor = min(
@@ -3040,18 +3185,13 @@ def _arrange_polyphonic_events(
                         key=lambda event: (event.midi, -event.amplitude),
                     )
                     selected.append(anchor)
-                    used_pitch_classes.add(anchor.midi % 12)
 
         remaining = [
             event
             for event in core_candidates
-            if event not in selected and event.midi % 12 not in used_pitch_classes
+            if event not in selected
         ]
-        selection_limit = (
-            core_voice_limit
-            if lead is not None
-            else max(0, core_voice_limit - 1)
-        )
+        selection_limit = core_voice_limit
         while remaining and len(selected) < selection_limit:
             def fill_score(event: _QuantizedPitchEvent) -> float:
                 consonance = sum(
@@ -3062,14 +3202,13 @@ def _arrange_polyphonic_events(
                 return event.amplitude + 0.025 * consonance
 
             fill = max(remaining, key=fill_score)
-            if fill.amplitude < max(0.36, peak * 0.62):
+            if fill.amplitude < 0.30:
                 break
             selected.append(fill)
-            used_pitch_classes.add(fill.midi % 12)
             remaining = [
                 event
                 for event in remaining
-                if event is not fill and event.midi % 12 not in used_pitch_classes
+                if event is not fill
             ]
 
         assignments: dict[int, _QuantizedPitchEvent] = {}
@@ -3079,7 +3218,7 @@ def _arrange_polyphonic_events(
             assignments[1] = anchor
         free_voices = [
             voice
-            for voice in range(2, core_voice_limit)
+            for voice in range(core_voice_limit)
             if voice not in assignments
         ]
         for event in sorted(
@@ -3105,20 +3244,21 @@ def _arrange_polyphonic_events(
             assignments[voice] = event
             free_voices.remove(voice)
 
-        for role in background_roles:
-            voice = background_voice_by_role[role]
+        for role in ranked_background_roles:
+            role_voices = background_voices_by_role[role]
+            if not role_voices:
+                continue
             role_candidates = [
                 event
                 for event in candidates
-                if (
-                    event.source_role == role
-                    and event.midi % 12 not in used_pitch_classes
-                )
+                if event.source_role == role
             ]
             if not role_candidates:
                 continue
 
-            def background_score(event: _QuantizedPitchEvent) -> float:
+            def background_score(
+                event: _QuantizedPitchEvent, voice: int
+            ) -> float:
                 previous_pitch = previous_voice_pitch.get(voice)
                 continuity = (
                     max(0.0, 1.0 - abs(event.midi - previous_pitch) / 12.0)
@@ -3130,9 +3270,59 @@ def _arrange_polyphonic_events(
                 )
                 return event.amplitude + 0.06 * continuity + 0.02 * duration_support
 
-            background = max(role_candidates, key=background_score)
-            assignments[voice] = background
-            used_pitch_classes.add(background.midi % 12)
+            available_voices = list(role_voices)
+            remaining_role_candidates = list(role_candidates)
+            while available_voices and remaining_role_candidates:
+                voice, background = max(
+                    (
+                        (voice, event)
+                        for voice in available_voices
+                        for event in remaining_role_candidates
+                    ),
+                    key=lambda item: background_score(item[1], item[0]),
+                )
+                assignments[voice] = background
+                available_voices.remove(voice)
+                remaining_role_candidates.remove(background)
+
+        # A reserved core lane that is silent at this onset can carry an
+        # additional independently supported background chord tone.  This is
+        # especially important when the combined accompaniment pass misses an
+        # entire quiet piano attack; leaving those lanes empty would re-create
+        # a fixed polyphony cap despite having verified candidates available.
+        assigned_event_ids = {id(event) for event in assignments.values()}
+        overflow_candidates = sorted(
+            (
+                event
+                for event in candidates
+                if event.source_role in BACKGROUND_ROLE_INSTRUMENTS
+                and id(event) not in assigned_event_ids
+            ),
+            key=lambda event: (event.amplitude, -event.midi),
+            reverse=True,
+        )
+        overflow_voices = [
+            voice
+            for voice in range(core_voice_limit)
+            if voice not in assignments
+        ]
+        for event in overflow_candidates:
+            if not overflow_voices:
+                break
+            voice = min(
+                overflow_voices,
+                key=lambda candidate_voice: (
+                    abs(
+                        event.midi
+                        - previous_voice_pitch.get(
+                            candidate_voice, event.midi
+                        )
+                    ),
+                    candidate_voice,
+                ),
+            )
+            assignments[voice] = event
+            overflow_voices.remove(voice)
 
         for voice, event in sorted(assignments.items()):
             result.append(
@@ -3274,44 +3464,65 @@ def _ai_events_to_nbs(
         arranged, config.instrument, default_instrument
     )
 
-    scheduled: dict[int, list[tuple[_VoicedPitchEvent, float, bool]]] = defaultdict(list)
+    scheduled: dict[
+        int, list[tuple[_VoicedPitchEvent, float, bool, float]]
+    ] = defaultdict(list)
     for event in arranged:
-        scheduled[event.start_tick].append((event, event.amplitude, True))
-        for retrigger_tick in _iter_phase_locked_retrigger_ticks(
+        onset_phase = (
+            event.phase_tick
+            if event.phase_tick is not None
+            else float(event.start_tick)
+        )
+        scheduled[event.start_tick].append(
+            (event, event.amplitude, True, onset_phase)
+        )
+        for retrigger_tick, retrigger_phase in _iter_phase_locked_retrigger_positions(
             event.start_tick,
             event.end_tick,
             config,
             phase_tick=event.phase_tick,
             end_phase_tick=event.end_phase_tick,
         ):
-            scheduled[retrigger_tick].append((event, event.amplitude * 0.82, False))
+            scheduled[retrigger_tick].append(
+                (event, event.amplitude * 0.82, False, retrigger_phase)
+            )
 
     notes: list[NbsNote] = []
     for tick in sorted(scheduled):
-        # Prefer true onsets, then confidence. Keep only one octave per pitch
-        # class so folded Minecraft notes cannot become a noisy unison stack.
+        # Prefer true onsets, then confidence.  Deduplicate only sounds that
+        # actually collapse to the same output instrument and key; octave
+        # doublings that remain distinct in NBS or Minecraft are musical data.
         candidates = sorted(
             scheduled[tick],
             key=lambda item: (item[2], item[1], item[0].end_tick - item[0].start_tick),
             reverse=True,
         )
-        retained: list[tuple[_VoicedPitchEvent, float, bool]] = []
+        retained: list[tuple[_VoicedPitchEvent, float, bool, float]] = []
         occupied_voices: set[int] = set()
-        pitch_classes: set[int] = set()
+        occupied_sounds: set[tuple[int, int]] = set()
         for candidate in candidates:
             if candidate[0].voice in occupied_voices:
                 continue
-            pitch_class = candidate[0].midi % 12
-            if pitch_class in pitch_classes:
+            raw_key = candidate[0].midi - NBS_LOWEST_MIDI
+            output_key = (
+                fold_key_to_minecraft_range(raw_key)
+                if config.minecraft_range
+                else raw_key
+            )
+            sound_identity = (
+                voice_instruments[candidate[0].voice],
+                output_key,
+            )
+            if sound_identity in occupied_sounds:
                 continue
             retained.append(candidate)
             occupied_voices.add(candidate[0].voice)
-            pitch_classes.add(pitch_class)
+            occupied_sounds.add(sound_identity)
             if len(retained) >= max_notes:
                 break
         retained.sort(key=lambda item: item[0].voice)
 
-        for event, amplitude, is_onset in retained:
+        for event, amplitude, is_onset, canonical_phase in retained:
             raw_key = event.midi - NBS_LOWEST_MIDI
             key = (
                 fold_key_to_minecraft_range(raw_key)
@@ -3353,7 +3564,8 @@ def _ai_events_to_nbs(
                     source_time_seconds=(
                         event.source_time_seconds
                         if is_onset and event.source_time_seconds is not None
-                        else timeline_origin_seconds + tick * tick_seconds
+                        else timeline_origin_seconds
+                        + canonical_phase * tick_seconds
                     ),
                     source_loudness=(source_level if is_onset else None),
                     source_snr_db=event.pitch_snr_db,
@@ -3803,17 +4015,32 @@ def _estimate_tempo_and_beats(
     return raw_bpm, refined_bpm, beat_times
 
 
-def _aggregate_by_tick(matrix, frame_ticks, tick_count: int, np):
+def _aggregate_by_tick(
+    matrix,
+    frame_ticks,
+    tick_count: int,
+    np,
+    *,
+    frame_times=None,
+):
     aggregate = np.zeros((matrix.shape[0], tick_count), dtype=np.float32)
+    source_times = (
+        np.full((matrix.shape[0], tick_count), np.nan, dtype=np.float64)
+        if frame_times is not None
+        else None
+    )
     valid_indices = np.flatnonzero(
         (frame_ticks >= 0) & (frame_ticks < tick_count)
     )
     for frame_index in valid_indices:
         tick = int(frame_ticks[frame_index])
+        if source_times is not None:
+            stronger = matrix[:, frame_index] > aggregate[:, tick]
+            source_times[stronger, tick] = float(frame_times[frame_index])
         np.maximum(
             aggregate[:, tick], matrix[:, frame_index], out=aggregate[:, tick]
         )
-    return aggregate
+    return (aggregate, source_times) if source_times is not None else aggregate
 
 
 def _pitch_candidates(
@@ -3878,6 +4105,9 @@ def _extract_pitch_events(
     np,
     *,
     unique_pitch_classes: bool = False,
+    source_times=None,
+    timeline_origin_seconds: float = 0.0,
+    tick_seconds: float | None = None,
 ) -> list[_PitchEvent]:
     events: list[_PitchEvent] = []
     last_selected = np.full(tick_db.shape[0], -10_000, dtype=np.int32)
@@ -3919,6 +4149,25 @@ def _extract_pitch_events(
                         strength_db=float(column[pitch]),
                         continuation=(
                             periodic and not newly_present and not strengthened
+                        ),
+                        source_time_seconds=(
+                            float(source_times[pitch, tick])
+                            if (
+                                source_times is not None
+                                and math.isfinite(
+                                    float(source_times[pitch, tick])
+                                )
+                                and not (
+                                    periodic
+                                    and not newly_present
+                                    and not strengthened
+                                )
+                            )
+                            else (
+                                timeline_origin_seconds + tick * tick_seconds
+                                if tick_seconds is not None
+                                else None
+                            )
                         ),
                     )
                 )
@@ -4242,20 +4491,31 @@ def _extract_monophonic_notes(
 
     if audio.size == 0 or float(np.max(np.abs(audio))) < 1e-6:
         return []
+    minimum_hz = float(librosa.note_to_hz(minimum_note))
+    maximum_hz = min(
+        float(librosa.note_to_hz(maximum_note)), sample_rate * 0.47
+    )
+    if minimum_hz >= maximum_hz:
+        return []
+    required_window = max(2048, math.ceil(3.0 * sample_rate / minimum_hz))
+    frame_length = min(
+        8192,
+        1 << math.ceil(math.log2(required_window)),
+    )
     try:
         f0, voiced, probability = librosa.pyin(
             audio,
-            fmin=float(librosa.note_to_hz(minimum_note)),
-            fmax=float(librosa.note_to_hz(maximum_note)),
+            fmin=minimum_hz,
+            fmax=maximum_hz,
             sr=sample_rate,
-            frame_length=2048,
+            frame_length=frame_length,
             hop_length=config.hop_length,
         )
     except Exception:
         return []
 
     rms = librosa.feature.rms(
-        y=audio, frame_length=2048, hop_length=config.hop_length
+        y=audio, frame_length=frame_length, hop_length=config.hop_length
     )[0]
     frame_count = min(len(f0), len(voiced), len(probability), len(rms))
     if frame_count == 0:
@@ -4390,8 +4650,9 @@ def _select_drum_components(
         for index, score in enumerate(scores)
         if index not in selected and score >= additional_floor
     ]
-    if additional:
-        selected.append(max(additional, key=lambda index: scores[index]))
+    selected.extend(
+        sorted(additional, key=lambda index: scores[index], reverse=True)
+    )
     return selected
 
 
@@ -4482,11 +4743,37 @@ def _extract_drum_notes(
         INSTRUMENTS["snare"],
         INSTRUMENTS["hat"],
     )
+    # Independent sub-band detectors often report neighboring frames for one
+    # physical hit.  Form bounded (non-transitive) attack groups before drum
+    # classification so one kick cannot become a two-tick flam merely because
+    # its low and high-frequency edges peaked at different frames.
+    grouping_radius = max(
+        1, _round_tick(0.025 * sample_rate / config.hop_length)
+    )
+    onset_groups: list[list[int]] = []
+    for frame in sorted(candidate_frames):
+        if (
+            onset_groups
+            and frame - onset_groups[-1][0] <= grouping_radius
+        ):
+            onset_groups[-1].append(frame)
+        else:
+            onset_groups.append([frame])
+
     # Independent sub-band detection can preserve a kick and hi-hat that occur
-    # together.  Keep only the strongest event after multiple frames quantize
+    # together. Keep only the strongest event after multiple attacks quantize
     # to the same NBS slot.
     hits: dict[tuple[int, int], NbsNote] = {}
-    for onset_frame in sorted(candidate_frames):
+    for onset_group in onset_groups:
+        onset_frame = max(
+            onset_group,
+            key=lambda frame: (
+                float(combined_flux[frame])
+                if 0 <= frame < len(combined_flux)
+                else -math.inf,
+                -frame,
+            ),
+        )
         if not 0 <= onset_frame < magnitude.shape[1]:
             continue
         combined_score = _clamp(
@@ -4494,10 +4781,20 @@ def _extract_drum_notes(
         )
         if combined_score < minimum_combined:
             continue
-        onset_time = float(
-            librosa.frames_to_time(
-                onset_frame, sr=sample_rate, hop_length=config.hop_length
-            )
+        # Quadratic peak interpolation removes the last whole-hop bias while
+        # retaining the absolute source clock.
+        fractional_frame = float(onset_frame)
+        if 0 < onset_frame and onset_frame + 1 < len(combined_flux):
+            left = float(combined_flux[onset_frame - 1])
+            center = float(combined_flux[onset_frame])
+            right = float(combined_flux[onset_frame + 1])
+            curvature = left - 2.0 * center + right
+            if abs(curvature) > 1e-12:
+                fractional_frame += _clamp(
+                    0.5 * (left - right) / curvature, -0.5, 0.5
+                )
+        onset_time = (
+            fractional_frame * config.hop_length / sample_rate
         )
         tick = _seconds_to_tick(
             onset_time, timeline_origin_seconds, tick_seconds
@@ -4505,8 +4802,8 @@ def _extract_drum_notes(
         if not 0 <= tick < tick_count:
             continue
 
-        start = max(0, onset_frame - 1)
-        end = min(magnitude.shape[1], onset_frame + 2)
+        start = max(0, min(onset_group) - 1)
+        end = min(magnitude.shape[1], max(onset_group) + 2)
         raw_components = [
             float(np.max(envelope[start:end])) if end > start else 0.0
             for envelope in band_flux
@@ -4596,6 +4893,7 @@ def _pitch_events_to_nbs(
                     panning=event.panning,
                     continuation=event.continuation,
                     source_midi=event.midi,
+                    source_time_seconds=event.source_time_seconds,
                 )
             )
     return sorted(result, key=lambda note: (note.tick, note.layer))
@@ -4648,13 +4946,25 @@ def _select_local_accompaniment_recovery(
         return []
     layer_base = min(note.layer for note in recovery_notes)
 
-    onset_covered = np.zeros(tick_count, dtype=bool)
     sustained_covered = np.zeros(tick_count, dtype=bool)
     for note in primary_notes:
-        onset_covered[max(0, note.tick - 2) : min(tick_count, note.tick + 3)] = True
         sustained_covered[
             max(0, note.tick - 5) : min(tick_count, note.tick + 6)
         ] = True
+
+    primary_by_midi: dict[int, list[int]] = defaultdict(list)
+    primary_by_sound: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for note in primary_notes:
+        if note.source_midi is not None:
+            primary_by_midi[note.source_midi].append(note.tick)
+        primary_by_sound[(note.instrument, note.key)].append(note.tick)
+
+    def pitch_is_covered(note: NbsNote, radius: int = 2) -> bool:
+        if note.source_midi is not None:
+            ticks = primary_by_midi.get(note.source_midi, ())
+        else:
+            ticks = primary_by_sound.get((note.instrument, note.key), ())
+        return any(abs(note.tick - tick) <= radius for tick in ticks)
 
     allowed_priorities: dict[int, float] = {}
 
@@ -4681,7 +4991,8 @@ def _select_local_accompaniment_recovery(
         )
         if len(onset_frames):
             strengths = onset_envelope[onset_frames]
-            strength_floor = float(np.quantile(strengths, 0.65))
+            quantile = _clamp(0.40 - 0.35 * config.sensitivity, 0.05, 0.40)
+            strength_floor = float(np.quantile(strengths, quantile))
             strength_reference = max(float(np.quantile(strengths, 0.95)), 1e-9)
             onset_times = librosa.frames_to_time(
                 onset_frames, sr=sample_rate, hop_length=onset_hop
@@ -4695,7 +5006,6 @@ def _select_local_accompaniment_recovery(
                 if (
                     float(strength) >= strength_floor
                     and 0 <= tick < tick_count
-                    and not bool(onset_covered[tick])
                 ):
                     priority = 0.60 + 0.40 * _clamp(
                         float(strength) / strength_reference, 0.0, 1.0
@@ -4750,7 +5060,7 @@ def _select_local_accompaniment_recovery(
 
     candidates_by_tick: dict[int, dict[tuple[int, int], NbsNote]] = defaultdict(dict)
     for note in recovery_notes:
-        if note.tick not in allowed_priorities:
+        if note.tick not in allowed_priorities or pitch_is_covered(note):
             continue
         identity = (note.instrument, note.key)
         previous = candidates_by_tick[note.tick].get(identity)
@@ -4783,12 +5093,13 @@ def _select_local_accompaniment_recovery(
             continue
         nonadjacent_ticks.append(tick)
 
-    primary_onsets = len({note.tick for note in primary_notes})
+    # Every retained position is tied to an independently detected physical
+    # onset (or a long uncovered active run) and to an uncovered CQT pitch.
+    # Limiting additions to 35% of the primary transcription prevented the
+    # safety pass from repairing systematically omitted inner chord tones.
+    # Keep only a pathological-density ceiling; ordinary detected onsets pass.
     duration_seconds = tick_count * tick_seconds
-    if globally_sparse:
-        maximum_onsets = max(4, math.ceil(duration_seconds * 1.5))
-    else:
-        maximum_onsets = max(2, math.ceil(max(1, primary_onsets) * 0.35))
+    maximum_onsets = max(8, math.ceil(duration_seconds * 20.0))
     selected_ticks = set(
         sorted(nonadjacent_ticks, key=lambda item: tick_scores[item], reverse=True)[
             :maximum_onsets
@@ -4858,19 +5169,21 @@ def _extract_cqt_accompaniment_notes(
     frame_ticks = _round_tick_array(
         (frame_times - timeline_origin_seconds) / tick_seconds, np
     )
-    tick_energy = _aggregate_by_tick(cqt, frame_ticks, tick_count, np)
+    tick_energy, tick_source_times = _aggregate_by_tick(
+        cqt,
+        frame_ticks,
+        tick_count,
+        np,
+        frame_times=frame_times,
+    )
     reference = float(np.max(tick_energy))
     tick_db = librosa.amplitude_to_db(
         tick_energy, ref=max(reference, 1e-12), top_db=80.0
     )
-    if config.separation == "demucs":
-        # The separated bass owns the true low end, but E2-B2 must remain
-        # available to rhythm guitar and clavinet parts.
-        e2_bin = max(
-            0,
-            int(round(float(librosa.note_to_midi("E2")))) - NBS_LOWEST_MIDI,
-        )
-        tick_db[:e2_bin, :] = -80.0
+    # Do not erase low accompaniment bins merely because a bass stem exists.
+    # Demucs can route a piano left hand, low guitar, organ pedal, or orchestral
+    # voice into ``other``; exact cross-stem duplicates are removed after both
+    # sources have been transcribed.
 
     analysis_config = (
         replace(config, sensitivity=max(config.sensitivity, 0.68))
@@ -4882,7 +5195,10 @@ def _extract_cqt_accompaniment_notes(
         analysis_config,
         panning_by_tick,
         np,
-        unique_pitch_classes=config.separation == "demucs",
+        unique_pitch_classes=False,
+        source_times=tick_source_times,
+        timeline_origin_seconds=timeline_origin_seconds,
+        tick_seconds=tick_seconds,
     )
     return _pitch_events_to_nbs(
         pitch_events,
@@ -5591,7 +5907,9 @@ def convert_audio_to_nbs(
     # Downstream musical intervals use the resolved value even when BPM was
     # auto-detected.
     config = replace(config, bpm=bpm)
-    ticks_per_second, effective_bpm = _resolve_timing_grid(bpm, config)
+    ticks_per_second, effective_bpm = _resolve_timing_grid(
+        bpm, config, duration_seconds
+    )
     if ticks_per_second <= 0 or ticks_per_second > 655.35:
         raise ConversionError("The selected BPM and resolution exceed NBS tempo limits.")
     tick_seconds = 1.0 / ticks_per_second
@@ -5628,7 +5946,11 @@ def convert_audio_to_nbs(
             accompaniment_layer_offset,
             drum_layer_offset,
             layer_names,
-        ) = _demucs_layer_layout(use_vocals, config.max_chord_notes)
+        ) = _demucs_layer_layout(
+            use_vocals,
+            config.max_chord_notes,
+            selected_background_roles,
+        )
 
         if config.transcription == "ai":
             report("Loading the Basic Pitch transcription model...")
@@ -5884,11 +6206,13 @@ def convert_audio_to_nbs(
                 role="bass",
             )
             ai_events["other"] = _coalesce_polyphonic_onsets(
-                ai_events["other"]
+                ai_events["other"],
+                maximum_shift_seconds=min(0.0125, 0.5 * tick_seconds),
             )
             for role in selected_background_roles:
                 ai_events[role] = _coalesce_polyphonic_onsets(
-                    ai_events[role]
+                    ai_events[role],
+                    maximum_shift_seconds=min(0.0125, 0.5 * tick_seconds),
                 )
             if selected_background_roles:
                 ai_events["other"] = _merge_instrument_background_events(
@@ -5950,8 +6274,8 @@ def convert_audio_to_nbs(
                     config,
                     layer=0,
                     default_instrument=INSTRUMENTS["flute"],
-                    minimum_note="E2",
-                    maximum_note="C6",
+                    minimum_note="A0",
+                    maximum_note="C8",
                     velocity_scale=0.90,
                     librosa=librosa,
                     np=np,
@@ -5972,8 +6296,8 @@ def convert_audio_to_nbs(
                 config,
                 layer=bass_layer,
                 default_instrument=INSTRUMENTS["bass"],
-                minimum_note="E1",
-                maximum_note="C4",
+                minimum_note="A0",
+                maximum_note="C8",
                 velocity_scale=0.85,
                 librosa=librosa,
                 np=np,
@@ -5998,8 +6322,8 @@ def convert_audio_to_nbs(
                     config,
                     layer=0,
                     default_instrument=INSTRUMENTS["flute"],
-                    minimum_note="E2",
-                    maximum_note="C6",
+                    minimum_note="A0",
+                    maximum_note="C8",
                     velocity_scale=0.90,
                     librosa=librosa,
                     np=np,
@@ -6020,8 +6344,8 @@ def convert_audio_to_nbs(
                 config,
                 layer=bass_layer,
                 default_instrument=INSTRUMENTS["bass"],
-                minimum_note="E1",
-                maximum_note="C4",
+                minimum_note="A0",
+                maximum_note="C8",
                 velocity_scale=0.85,
                 librosa=librosa,
                 np=np,
@@ -6233,7 +6557,7 @@ def convert_audio_to_nbs(
     if config.include_drums:
         layer_names.extend(["Kick", "Snare", "Hi-hat"])
 
-    _validate_source_timing(
+    maximum_timing_error_seconds = _validate_source_timing(
         all_notes,
         timeline_origin_seconds,
         ticks_per_second,
@@ -6265,6 +6589,7 @@ def convert_audio_to_nbs(
         layer_count=len(layer_names),
         timing=config.timing,
         vocal_handling=vocal_handling,
+        maximum_timing_error_seconds=maximum_timing_error_seconds,
     )
 
 
@@ -6335,11 +6660,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-chord-notes",
-        type=_bounded_int(1, 8),
-        default=4,
+        type=_bounded_int(1, 24),
+        default=12,
         help=(
-            "maximum simultaneous accompaniment voices; voices above three "
-            "protect separated background instruments (default: 4)"
+            "maximum simultaneous accompaniment voices, including protected "
+            "background instruments (default: 12)"
         ),
     )
     parser.add_argument(
@@ -6384,10 +6709,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-drums", action="store_true", help="do not generate percussion notes"
     )
-    parser.add_argument(
+    range_group = parser.add_mutually_exclusive_group()
+    range_group.add_argument(
+        "--minecraft-range",
+        action="store_true",
+        help=(
+            "lossily fold pitches into Minecraft's playable two-octave range "
+            "(default: preserve all 88 NBS keys)"
+        ),
+    )
+    range_group.add_argument(
         "--full-range",
         action="store_true",
-        help="keep all 88 NBS keys instead of folding into Minecraft's range",
+        help=(
+            "preserve all 88 NBS keys (the default; retained for compatibility)"
+        ),
     )
     parser.add_argument(
         "--time-signature",
@@ -6501,7 +6837,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         retrigger_beats=args.retrigger_beats,
         instrument=instrument,
         include_drums=not args.no_drums,
-        minecraft_range=not args.full_range,
+        minecraft_range=args.minecraft_range,
         time_signature=args.time_signature,
         separation=args.separation,
         transcription=args.transcription,
@@ -6553,6 +6889,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"(detected: {result.detected_bpm:.2f}) / "
         f"NBS timeline: {result.ticks_per_second:.2f} ticks/s "
         f"({timing_label})"
+    )
+    print(
+        "Maximum verified source-time rounding error: "
+        f"{result.maximum_timing_error_seconds * 1000.0:.2f} ms"
     )
     vocal_label = {
         "detected": "vocals detected (dedicated layer)",
