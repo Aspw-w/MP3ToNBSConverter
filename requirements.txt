@@ -1,0 +1,11 @@
+demucs>=4.1,<5
+librosa>=0.11,<2
+mir_eval>=0.8,<1
+numpy>=1.24
+onnxruntime>=1.29,<2
+pretty-midi>=0.2.11,<1
+resampy>=0.4,<0.5
+setuptools>=77,<81
+soundfile>=0.12
+# basic-pitch==0.4.0 is installed with --no-deps by setup.bat so Python 3.14
+# uses ONNX instead of the package's unavailable TensorFlow dependency.

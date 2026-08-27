@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+.stem_cache/
+.model_cache/
+.test_audio/
+*.nbs
