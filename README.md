@@ -4,8 +4,10 @@ This project converts mixed audio into an arranged Open Note Block Studio
 `.nbs` v5 song. The default output prioritizes timing and transcription quality:
 important melody and bass phrases are protected, locally quiet passages receive
 an independent recovery pass, weak false notes are rejected, and accompaniment
-density is controlled before the file is written. An explicit 10 ticks/s mode
-remains available for Minecraft schematic and structure export.
+density is controlled before the file is written. Every pitch is octave-folded
+into Minecraft's playable NBS-key range by default, so an importer does not
+silently discard out-of-range notes. An explicit 10 ticks/s mode remains
+available for Minecraft schematic and structure export.
 
 ## Conversion architecture
 
@@ -134,8 +136,8 @@ Use `--force` to overwrite an existing output file.
 # Override detected BPM while retaining the precise 40 ticks/s timeline.
 .\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --bpm 128
 
-# Deliberately use Minecraft-compatible timing and fold pitches into its range.
-.\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --timing minecraft --minecraft-range
+# Use Minecraft-compatible timing as well as the default safe pitch range.
+.\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --timing minecraft
 
 # Use an eight-subdivision BPM grid for NBS-only playback.
 .\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --timing beat --bpm 128 --ticks-per-beat 8
@@ -159,8 +161,8 @@ Use `--force` to overwrite an existing output file.
 # Skip Demucs for a faster, lower-quality conversion.
 .\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --separation basic
 
-# Lossily fold the default full 88-key output for an in-game note-block build.
-.\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --minecraft-range
+# Preserve all 88 keys only for native NBS playback, not Minecraft import.
+.\.venv\Scripts\python.exe mp3_to_nbs.py song.mp3 --full-range
 ```
 
 Show every option with:
@@ -202,10 +204,13 @@ mechanical one-note repetition heard at a one-beat interval. Continuations also
 cannot be normalized back into false full-strength accents. Use
 `--retrigger-beats 0` when a sound pack has long samples and needs no sustain
 refresh. Each continuation is calculated from its original source onset rather
-than from the preceding rounded tick. Native NBS output keeps the complete
-88-key range and distinct octave doublings by default. `--minecraft-range`
-folds out-of-range pitches by octaves and deduplicates only notes that collapse
-to the exact same instrument and output key.
+than from the preceding rounded tick. The default output folds every pitch by
+whole octaves into Minecraft's playable NBS-key range 33-57. This retains the
+pitch class and prevents an importer from reporting or discarding out-of-range
+notes. When two source octaves collapse to the exact same instrument and output
+key at the same instant, only the louder duplicate is retained. Use
+`--full-range` only for native Open Note Block Studio playback when preserving
+all 88 keys and distinct octave doublings matters more than Minecraft import.
 
 Use the default sensitivity first. The converter already runs a locally
 normalized weak-phrase pass and validates its candidates against the untouched
@@ -221,7 +226,7 @@ Minecraft arrangement is preferred.
 The default `--timing precise` and optional `--timing beat` can produce a tick
 rate other than 10, 5, or 2.5 ticks/s. Such a song plays at the intended speed
 in Open Note Block Studio but can change speed after Minecraft NBT or structure
-export. Select `--timing minecraft --minecraft-range` for that in-game export
+export. Select `--timing minecraft` for that in-game export
 path; its 100 ms grid necessarily merges source attacks that occur inside the
 same tick, and its two-octave range cannot retain every source register.
 

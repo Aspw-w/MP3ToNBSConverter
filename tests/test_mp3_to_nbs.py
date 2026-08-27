@@ -11,6 +11,7 @@ from mp3_to_nbs import (
     MINECRAFT_TIMELINE_TPS,
     PRECISE_TIMELINE_TPS,
     ConversionConfig,
+    ConversionError,
     ConversionResult,
     NbsNote,
     _ConsoleProgress,
@@ -57,8 +58,10 @@ from mp3_to_nbs import (
     _source_cache_key,
     _stabilize_layer_instruments,
     _stable_voice_instruments,
+    _validate_minecraft_key_range,
     _validate_source_timing,
     _write_instrumental_accompaniment_stem,
+    build_parser,
     choose_instrument,
     fold_key_to_minecraft_range,
     write_nbs,
@@ -590,10 +593,10 @@ class SeparationTests(unittest.TestCase):
             )
         )
 
-    def test_default_configuration_preserves_dense_full_range_music(self):
+    def test_default_configuration_is_minecraft_pitch_safe(self):
         config = ConversionConfig()
         self.assertEqual(config.max_chord_notes, 12)
-        self.assertFalse(config.minecraft_range)
+        self.assertTrue(config.minecraft_range)
         self.assertEqual(config.transcription, "ai")
         self.assertEqual(config.retrigger_beats, 2.0)
         self.assertEqual(config.vocals, "auto")
@@ -664,7 +667,9 @@ class SeparationTests(unittest.TestCase):
             0.025,
             40,
             np.zeros(40, dtype=np.int16),
-            ConversionConfig(bpm=120, max_chord_notes=3),
+            ConversionConfig(
+                bpm=120, max_chord_notes=3, minecraft_range=False
+            ),
             layer_offset=0,
             max_notes=3,
             default_instrument=0,
@@ -673,6 +678,42 @@ class SeparationTests(unittest.TestCase):
 
         self.assertEqual({note.source_midi for note in notes}, {48, 60, 72})
         self.assertEqual(len({note.key for note in notes}), 3)
+
+    def test_default_output_folds_every_source_octave_into_minecraft_range(self):
+        notes = _ai_events_to_nbs(
+            [
+                _TimedPitchEvent(0.0, 0.5, midi, 0.8)
+                for midi in (21, 60, 108)
+            ],
+            0.0,
+            0.025,
+            40,
+            np.zeros(40, dtype=np.int16),
+            ConversionConfig(bpm=120, max_chord_notes=3),
+            layer_offset=0,
+            max_notes=3,
+            default_instrument=0,
+            velocity_scale=1.0,
+        )
+
+        self.assertEqual({note.source_midi for note in notes}, {21, 60, 108})
+        self.assertTrue(all(33 <= note.key <= 57 for note in notes))
+        self.assertEqual(_validate_minecraft_key_range(notes), 2)
+
+    def test_minecraft_range_invariant_rejects_an_unfolded_note(self):
+        with self.assertRaisesRegex(ConversionError, "outside 33\\.\\.57"):
+            _validate_minecraft_key_range([NbsNote(0, 0, 0, 58)])
+
+    def test_command_line_uses_minecraft_range_unless_full_range_is_explicit(self):
+        parser = build_parser()
+
+        self.assertTrue(parser.parse_args(["song.mp3"]).minecraft_range)
+        self.assertTrue(
+            parser.parse_args(["song.mp3", "--minecraft-range"]).minecraft_range
+        )
+        self.assertFalse(
+            parser.parse_args(["song.mp3", "--full-range"]).minecraft_range
+        )
 
     def test_polyphonic_planner_does_not_drop_a_quiet_continuing_focus(self):
         events = [

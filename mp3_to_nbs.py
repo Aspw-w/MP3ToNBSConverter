@@ -145,10 +145,10 @@ class ConversionConfig:
     retrigger_beats: float = 2.0
     instrument: int | None = None
     include_drums: bool = True
-    # Native NBS supports all 88 piano keys.  Folding is an explicitly lossy
-    # compatibility mode for Minecraft builds and must not be the fidelity
-    # default.
-    minecraft_range: bool = False
+    # Minecraft accepts only NBS keys 33..57.  Keep every detected pitch by
+    # octave-folding it into that range by default; otherwise downstream
+    # Minecraft importers silently discard valid transcription events.
+    minecraft_range: bool = True
     sample_rate: int = 22_050
     hop_length: int = 256
     time_signature: int = 4
@@ -173,6 +173,8 @@ class ConversionResult:
     timing: str = "precise"
     vocal_handling: str = "dedicated"
     maximum_timing_error_seconds: float = 0.0
+    minecraft_range: bool = True
+    octave_folded_notes: int = 0
 
     @property
     def melodic_notes(self) -> int:
@@ -503,6 +505,31 @@ def _validate_source_timing(
                 "An internal timing check failed before writing the NBS file."
             )
     return maximum_error
+
+
+def _validate_minecraft_key_range(notes: Iterable[NbsNote]) -> int:
+    """Reject any note Minecraft would ignore and count octave-folded notes."""
+
+    note_list = list(notes)
+    out_of_range = [
+        note.key
+        for note in note_list
+        if not MINECRAFT_KEY_MIN <= note.key <= MINECRAFT_KEY_MAX
+    ]
+    if out_of_range:
+        raise ConversionError(
+            "An internal Minecraft-range check failed before writing the NBS "
+            f"file: {len(out_of_range)} note(s) use keys outside "
+            f"{MINECRAFT_KEY_MIN}..{MINECRAFT_KEY_MAX} "
+            f"(observed {min(out_of_range)}..{max(out_of_range)})."
+        )
+
+    return sum(
+        1
+        for note in note_list
+        if note.source_midi is not None
+        and note.key != note.source_midi - NBS_LOWEST_MIDI
+    )
 
 
 def _resolve_timing_grid(
@@ -6557,6 +6584,9 @@ def convert_audio_to_nbs(
     if config.include_drums:
         layer_names.extend(["Kick", "Snare", "Hi-hat"])
 
+    octave_folded_notes = (
+        _validate_minecraft_key_range(all_notes) if config.minecraft_range else 0
+    )
     maximum_timing_error_seconds = _validate_source_timing(
         all_notes,
         timeline_origin_seconds,
@@ -6590,6 +6620,8 @@ def convert_audio_to_nbs(
         timing=config.timing,
         vocal_handling=vocal_handling,
         maximum_timing_error_seconds=maximum_timing_error_seconds,
+        minecraft_range=config.minecraft_range,
+        octave_folded_notes=octave_folded_notes,
     )
 
 
@@ -6712,19 +6744,23 @@ def build_parser() -> argparse.ArgumentParser:
     range_group = parser.add_mutually_exclusive_group()
     range_group.add_argument(
         "--minecraft-range",
+        dest="minecraft_range",
         action="store_true",
         help=(
-            "lossily fold pitches into Minecraft's playable two-octave range "
-            "(default: preserve all 88 NBS keys)"
+            "octave-fold every pitch into Minecraft's playable key range "
+            "33..57 (default)"
         ),
     )
     range_group.add_argument(
         "--full-range",
-        action="store_true",
+        dest="minecraft_range",
+        action="store_false",
         help=(
-            "preserve all 88 NBS keys (the default; retained for compatibility)"
+            "preserve all 88 NBS keys for native NBS playback; Minecraft "
+            "importers may discard out-of-range notes"
         ),
     )
+    parser.set_defaults(minecraft_range=True)
     parser.add_argument(
         "--time-signature",
         type=int,
@@ -6894,6 +6930,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "Maximum verified source-time rounding error: "
         f"{result.maximum_timing_error_seconds * 1000.0:.2f} ms"
     )
+    if result.minecraft_range:
+        print(
+            "Minecraft pitch range: verified keys "
+            f"{MINECRAFT_KEY_MIN}..{MINECRAFT_KEY_MAX}; "
+            f"{result.octave_folded_notes} notes octave-folded; "
+            "0 out-of-range notes"
+        )
+    else:
+        print(
+            "Pitch range: full 88-key NBS; Minecraft importers may ignore "
+            f"keys outside {MINECRAFT_KEY_MIN}..{MINECRAFT_KEY_MAX}"
+        )
     vocal_label = {
         "detected": "vocals detected (dedicated layer)",
         "instrumental": "no vocals (residual merged into accompaniment)",
